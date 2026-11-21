@@ -5,7 +5,6 @@ FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf107
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV HOME=/tmp
 WORKDIR /app
-COPY selector.py /app/selector.py
-COPY selector_db.json /app/selector_db.json
-RUN chmod -R a+rx /app
+COPY selector.py selector_map.bin src.zip /app/
+RUN chmod -R a+rX /app
 CMD ["python", "/app/selector.py"]
