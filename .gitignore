@@ -1,0 +1,26 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Coverage and testing artifacts
+.coverage
+.coverage.*
+*.db
+.cov_*.db
+dialect_cov.json
+output*.jsonl
+starter_output.jsonl
+*.log
+
+# Raw sources and archives not needed in the clean submission repo
+sqlglot_repo/
+blast-radius-sample.tar.gz
+
+# Environment and sensitive files
+.env
+.env.*
+*.pem
+*.key
+*.token
+credentials.json
