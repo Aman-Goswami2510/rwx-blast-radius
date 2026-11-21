@@ -181,6 +181,75 @@ def importerT(path):
     return m
 
 
+
+# ---------------------------------------------------------------- attribute reference index
+# For a class-body constant `N = ...` we can narrow the tests to those that actually read N, but only when every
+# read of N happens inside a function that runs at test time (never in module/class bodies or import-time code).
+_FUNCS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+ref_lines = defaultdict(list)  # name -> [(path, line)] runtime reads (functions)
+ref_unsafe = set()  # names read at import time or by string
+test_ref_mask = defaultdict(int)  # name -> tests of test files that mention the name
+
+
+def _scan_refs(path, tree):
+    in_sq = path.startswith("sqlglot/")
+    imp = imp_lines.get(path, set())
+
+    def walk(node, in_func, in_class_body):
+        for child in ast.iter_child_nodes(node):
+            f = in_func or isinstance(child, _FUNCS)
+            name = None
+            if isinstance(child, ast.Name):
+                name = child.id
+                store = isinstance(child.ctx, ast.Store)
+            elif isinstance(child, ast.Attribute):
+                name = child.attr
+                store = isinstance(child.ctx, ast.Store)
+            elif isinstance(child, ast.Constant) and isinstance(child.value, str) and child.value.isidentifier():
+                if in_sq:
+                    ref_unsafe.add(child.value)  # getattr(x, "NAME") style access
+            if name is not None:
+                if not in_sq:
+                    test_ref_mask[name] |= by_file_ref.get(path, 0)
+                elif store and isinstance(child, ast.Name) and not in_func:
+                    pass  # class/module-level definition of the name itself
+                elif in_func:
+                    if child.lineno in imp:
+                        ref_unsafe.add(name)  # executed while the package is imported (metaclass, decorators)
+                    ref_lines[name].append((path, child.lineno))
+                else:
+                    ref_unsafe.add(name)  # read at import time (e.g. {**Base.NAME, ...})
+            walk(child, f, isinstance(child, ast.ClassDef) or (in_class_body and not f))
+
+    walk(tree, False, False)
+
+
+by_file_ref = defaultdict(int)
+for _t in T:
+    by_file_ref[_t["file"]] |= 1 << _t["number"]
+for _p in py_files:
+    try:
+        _scan_refs(_p, ast.parse(src[_p]))
+    except SyntaxError:
+        pass
+
+
+def attr_refmask(name):
+    if name in ref_unsafe:
+        return None
+    m = test_ref_mask.get(name, 0)
+    for pth, ln in ref_lines.get(name, ()):
+        m |= hits.get(pth, {}).get(ln, 0)
+    return m
+
+
+def target_names(node):
+    if isinstance(node, ast.Assign) and all(isinstance(t, ast.Name) for t in node.targets):
+        return [t.id for t in node.targets]
+    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+        return [node.target.id]
+    return None
+
 # ---------------------------------------------------------------- sig table
 sig_ids = {0: 0}
 sigs = [[]]
@@ -287,7 +356,23 @@ def analyze_sqlglot(path):
             elif enc_cls and not in_fn:
                 key = class_key(chain)
                 c_ = enc_cls[-1]
-                m |= classT.get(key, 0) | mask_over(node_lo(c_), c_.end_lineno)
+                narrowed = None
+                if kind == "simple" and classT.get(key, 0):
+                    names = target_names(node)
+                    if names:
+                        r = 0
+                        for nm in names:
+                            rm = attr_refmask(nm)
+                            if rm is None:
+                                r = None
+                                break
+                            r |= rm
+                        if r is not None:
+                            narrowed = classT[key] & r
+                if narrowed is not None:
+                    m |= narrowed
+                else:
+                    m |= classT.get(key, 0) | mask_over(node_lo(c_), c_.end_lineno)
             else:
                 m |= tF | iT
                 if kind == "func":
@@ -546,3 +631,10 @@ sys.stderr.write(
     "sigs=%d files=%d map=%.0f KB src.zip=%.0f KB\n"
     % (len(sigs), len(F), len(blob) / 1024, os.path.getsize(os.path.join(OUT, "src.zip")) / 1024)
 )
+
+if os.environ.get("DBG"):
+    for nm in os.environ["DBG"].split(","):
+        rm = attr_refmask(nm)
+        sys.stderr.write("%s unsafe=%s refs=%s mask_tests=%s\n" % (nm, nm in ref_unsafe, ref_lines.get(nm, [])[:6], None if rm is None else bin(rm).count("1")))
+    k = [k for k in classT if k.endswith(":TSQL")]
+    sys.stderr.write("TSQL keys %s %s\n" % (k, [bin(classT[x]).count("1") for x in k]))

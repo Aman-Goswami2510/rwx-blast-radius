@@ -12,12 +12,13 @@ import re
 import subprocess
 import sys
 
-SQ, TESTS, SELDIR, BASE, SEED, COUNT, OUT = sys.argv[1:8]
+SQ, TESTS, SELDIR, BASE, SEED, COUNT, OUT = [os.path.abspath(a) if i in (0,1,2,3,6) else a for i, a in enumerate(sys.argv[1:8])]
 KINDS = sys.argv[8].split(",") if len(sys.argv) > 8 else None
 COUNT = int(COUNT)
 rnd = random.Random(int(SEED))
 HERE = os.path.dirname(os.path.abspath(__file__))
 base_fail = set(json.load(open(BASE)))
+COVERED = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "covered.json")))
 T = json.load(open(TESTS))["tests"]
 dur = {t["number"]: round(t["seconds"] * 1000) for t in T}
 
@@ -30,6 +31,9 @@ for dp, dn, fn in os.walk(os.path.join(SQ, "sqlglot")):
 pyfiles.sort()
 
 FLIPS = [
+    (r"\bif not ", "if "), (r"\bcopy=False\b", "copy=True"), (r"\bcopy=True\b", "copy=False"),
+    (r"seq_get\((\w+), 0\)", r"seq_get(\1, 1)"), (r" is None\b", " == None"), (r" is not None\b", " != None"),
+    (r" <= ", " < "), (r" >= ", " > "), (r" and ", " or "), (r" or ", " and "),
     (r"\bis None\b", "is not None"), (r"\bis not None\b", "is None"), (r" == ", " != "), (r" != ", " == "),
     (r" and ", " or "), (r" or ", " and "), (r"\bTrue\b", "False"), (r"\bFalse\b", "True"),
     (r" < ", " <= "), (r" > ", " >= "), (r" \+ 1\b", " + 2"), (r"\bnot ", ""), (r"\bin ", "not in "),
@@ -37,7 +41,10 @@ FLIPS = [
 
 
 def pick_line(kind, path, lines):
+    cv = set(COVERED.get(path, []))
     idx = [i for i, l in enumerate(lines) if l.strip() and not l.strip().startswith(("#", '"""', "'''"))]
+    if kind in ("flip", "const", "delete", "ret", "insert", "rename"):
+        idx = [i for i in idx if (i + 1) in cv]
     rnd.shuffle(idx)
     for i in idx:
         l = lines[i]
@@ -73,6 +80,10 @@ def pick_line(kind, path, lines):
         elif kind == "syntax":
             if l.rstrip().endswith(":"):
                 return i, [l.rstrip()[:-1]]
+        elif kind == "rename":
+            m = re.match(r"(\s*)def (\w+)\(", l)
+            if m:
+                return i, [l.replace("def %s(" % m.group(2), "def %s_renamed(" % m.group(2), 1)]
         elif kind == "ret":
             if l.lstrip().startswith("return ") and (len(l) - len(l.lstrip())) >= 8:
                 return i, [l.replace("return ", "return None  # ", 1)]
@@ -83,7 +94,7 @@ def sh(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
 
-kinds = KINDS or ["flip", "const", "delete", "comment", "insert", "ret", "syntax"]
+kinds = KINDS or ["flip", "flip", "flip", "const", "const", "delete", "comment", "insert", "ret", "syntax", "rename"]
 results = open(OUT, "a")
 done = 0
 attempts = 0
@@ -104,7 +115,7 @@ while done < COUNT and attempts < COUNT * 20:
     open(full, "w").write("\n".join(mutated))
     patch = sh(["git", "diff", "--no-color"], cwd=SQ).stdout
     # run real tests
-    pk_out = os.path.join(SQ, "..", "mut_%s_%d.pkl" % (SEED, done))
+    pk_out = os.path.abspath(os.path.join(SQ, "..", "mut_%s_%d.pkl" % (SEED, done)))
     r = sh([sys.executable, os.path.join(HERE, "trace_tests.py"), SQ, TESTS, pk_out, "--notrace"], timeout=900)
     failing = set()
     if os.path.exists(pk_out):
