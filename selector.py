@@ -11,6 +11,7 @@ How it works (see DESIGN.md):
     compile it (a file that no longer compiles breaks everything that imports it), then split the chosen
     tests over at most 8 workers so that makespan + 2 s per worker is minimal.
 """
+import ast
 import json
 import marshal
 import os
@@ -127,6 +128,41 @@ def apply_hunks(old_text, hunks):
     return "\n".join(new) + "\n"
 
 
+class _Norm(ast.NodeTransformer):
+    """Normalise comparisons that mean the same thing: `x is None` == `x == None`, `x is Enum.MEMBER` == `x == Enum.MEMBER`."""
+
+    @staticmethod
+    def _singleton(n):
+        if isinstance(n, ast.Constant):
+            return n.value is None
+        if isinstance(n, ast.Attribute):
+            return n.attr.isupper() and isinstance(n.value, (ast.Name, ast.Attribute))
+        return False
+
+    def visit_Compare(self, node):
+        self.generic_visit(node)
+        ops = []
+        for op, comp in zip(node.ops, node.comparators):
+            if isinstance(op, ast.Is) and self._singleton(comp):
+                op = ast.Eq()
+            elif isinstance(op, ast.IsNot) and self._singleton(comp):
+                op = ast.NotEq()
+            ops.append(op)
+        node.ops = ops
+        return node
+
+
+def semantically_equal(old_text, new_text):
+    """True when both sources parse to the same tree after normalising equivalent comparisons.
+    Comments, blank lines and formatting never appear in the tree, so they are equal by construction."""
+    try:
+        a = ast.dump(_Norm().visit(ast.parse(old_text)), include_attributes=False)
+        b = ast.dump(_Norm().visit(ast.parse(new_text)), include_attributes=False)
+    except Exception:
+        return False
+    return a == b
+
+
 class Selector:
     def __init__(self):
         self.M = load_map()
@@ -154,6 +190,12 @@ class Selector:
         n = info["n"]
         if fd["new_file"]:
             return False
+        if not fd["deleted"] and not fd["rename"] and fd["hunks"] and not any(h["start"] <= 2 for h in fd["hunks"]):
+            try:
+                if semantically_equal(self.old_source(path), apply_hunks(self.old_source(path), fd["hunks"])):
+                    return True  # nothing that executes has changed (comments / formatting / equivalent comparisons)
+            except Exception:
+                pass
         if fd["deleted"] or fd["rename"] and fd["new"] != fd["old"]:
             out.add(self.sig(info["imp"]))
             out.add(self.sig(self.M["misc"]["dialect_imports"]))
@@ -181,7 +223,7 @@ class Selector:
                             prev = ""
                             if g >= 1:
                                 prev = self.prev_line(path, g)
-                            if ins[g] or g < 2 or prev.rstrip().endswith("\\"):
+                            if ins[g] or (g < 2 and "coding" in t) or prev.rstrip().endswith("\\"):
                                 out.add(self.sig(pq[g]))
                                 nontrivial = True
                             continue
