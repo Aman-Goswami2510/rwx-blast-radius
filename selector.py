@@ -234,8 +234,9 @@ class Selector:
         except SyntaxError:
             out.add(self.sig(info["imp"]))
             out.add(self.sig(self.M["misc"]["dialect_imports"]))
-            if path.startswith("sqlglot/") and not path.startswith(("sqlglot/dialects/", "sqlglot/parsers/",
-                                                                       "sqlglot/generators/", "sqlglot/typing/")):
+            if path.startswith("sqlglot/"):
+                # a package module that no longer compiles breaks the dialect registry and everything using it;
+                # running every test costs ~45 s (bounded by the longest test), a miss costs 300 s
                 out.add(ALL)
         except Exception:
             out.add(ALL)
