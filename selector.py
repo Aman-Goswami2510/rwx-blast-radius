@@ -12,11 +12,13 @@ How it works (see DESIGN.md):
     tests over at most 8 workers so that makespan + 2 s per worker is minimal.
 """
 import ast
+import io
 import json
 import marshal
 import os
 import re
 import sys
+import tokenize
 import zipfile
 import zlib
 
@@ -128,6 +130,36 @@ def apply_hunks(old_text, hunks):
     return "\n".join(new) + "\n"
 
 
+def literal_only(adds):
+    """True when the added text contains no names (apart from True/False/None and the assignment target), i.e. it
+    cannot raise while a module is imported."""
+    text = "\n".join(t for _, t in adds)
+    toks = []
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+            toks.append(tok)
+    except Exception:
+        pass
+    line_first = True
+    for i, tok in enumerate(toks):
+        if tok.type in (tokenize.INDENT, tokenize.DEDENT, tokenize.COMMENT):
+            continue
+        if tok.type in (tokenize.NEWLINE, tokenize.NL):
+            line_first = True
+            continue
+        if tok.type == tokenize.NAME:
+            if tok.string in ("True", "False", "None"):
+                pass
+            elif line_first and i + 1 < len(toks) and toks[i + 1].string in ("=", ":"):
+                pass
+            else:
+                return False
+        elif tok.type not in (tokenize.STRING, tokenize.NUMBER, tokenize.OP, tokenize.ENDMARKER):
+            return False
+        line_first = False
+    return True
+
+
 class _Norm(ast.NodeTransformer):
     """Normalise comparisons that mean the same thing: `x is None` == `x == None`, `x is Enum.MEMBER` == `x == Enum.MEMBER`."""
 
@@ -187,6 +219,7 @@ class Selector:
         if info is None:
             return False
         ef, pq, cx, ci, ins = info["ef"], info["pq"], info["cx"], info["ci"], info["ins"]
+        efw = info.get("efw")
         n = info["n"]
         if fd["new_file"]:
             return False
@@ -209,8 +242,16 @@ class Selector:
                     if l < 1 or l > n:
                         out.add(self.sig(info["imp"]))
                         nontrivial = True
+                lit = None
                 for l in code_rem:
-                    out.add(self.sig(ef[l - 1]))
+                    s_ = ef[l - 1]
+                    w_ = efw[l - 1] if efw else -2
+                    if w_ != -2:
+                        if lit is None:
+                            lit = literal_only(add)
+                        if not lit:
+                            s_ = w_
+                    out.add(self.sig(s_))
                     nontrivial = True
                 code_add = [(g, t) for g, t in add if t.strip() and not t.lstrip().startswith("#")]
                 if not rem:

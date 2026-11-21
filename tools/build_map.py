@@ -18,6 +18,7 @@ import zlib
 from collections import defaultdict
 
 SQ, TESTS_JSON, TRACE, OUT = sys.argv[1:5]
+IMPTRACE = sys.argv[5] if len(sys.argv) > 5 else None
 os.makedirs(OUT, exist_ok=True)
 T = json.load(open(TESTS_JSON))["tests"]
 ids = [t["id"] for t in T]
@@ -250,6 +251,50 @@ def target_names(node):
         return [node.target.id]
     return None
 
+
+# ---------------------------------------------------------------- lazy-import index
+# A function body that runs while a module is imported (decorator, metaclass, table builder ...) can break every test
+# that triggers that import, even tests that never touch the changed module afterwards.
+imp_base = set()
+imp_by_line = defaultdict(list)  # (file, line) -> modules whose import executes it (beyond `import sqlglot`)
+if IMPTRACE:
+    _it = pickle.load(open(IMPTRACE, "rb"))
+    imp_base = _it["base"]
+    for _m, _lines in _it["mods"].items():
+        for _fl in _lines - imp_base:
+            imp_by_line[_fl].append(_m)
+_lazy_cache = {}
+
+
+def lazyT(mod):
+    r = _lazy_cache.get(mod)
+    if r is None:
+        p = mod2path.get(mod)
+        r = 0
+        if p:
+            r = touchF(p)
+            for g in importers.get(mod, ()):
+                gp = mod2path[g]
+                if gp.startswith("tests/"):
+                    r |= by_file_ref.get(gp, 0)
+        _lazy_cache[mod] = r
+    return r
+
+
+def import_extra(path, lo, hi):
+    """None when the lines do not run at import; ALL when they run during `import sqlglot`; else the lazy-import tests."""
+    m = 0
+    ran = False
+    for l in range(lo, hi + 1):
+        fl = (path, l)
+        if fl in imp_base:
+            return ALL
+        if fl in imp_by_line:
+            ran = True
+            for mod in imp_by_line[fl]:
+                m |= lazyT(mod)
+    return m if ran else None
+
 # ---------------------------------------------------------------- sig table
 sig_ids = {0: 0}
 sigs = [[]]
@@ -310,7 +355,12 @@ def instring_gaps(text, n):
     return gaps
 
 
+path_cur = [None]
+last_wide = [None]
+
+
 def analyze_sqlglot(path):
+    path_cur[0] = path
     text = src[path]
     lines = text.split("\n")
     N = len(text.splitlines())
@@ -331,6 +381,7 @@ def analyze_sqlglot(path):
         return any(l in IMP for l in range(lo, hi + 1))
 
     unit_mask = [None] * (N + 2)  # final mask per line (None = not code in a unit)
+    unit_wide = [None] * (N + 2)  # wide mask for lines whose mask was narrowed by attribute reads
     unit_scope = [None] * (N + 2)  # ("mod"|"cls"|"fn", classkey)
     stmt_chain = {}
 
@@ -348,6 +399,10 @@ def analyze_sqlglot(path):
         scope_cls = None
         in_fn = any(isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef)) for c in chain)
         enc_cls = [c for c in chain if isinstance(c, ast.ClassDef)]
+        if in_fn and kind != "func":
+            ex = import_extra(path_cur[0], lo, hi)
+            if ex is not None:
+                m |= ex
         if imp or kind == "class":
             if kind == "class":
                 key = class_key(chain + [node])
@@ -369,10 +424,12 @@ def analyze_sqlglot(path):
                             r |= rm
                         if r is not None:
                             narrowed = classT[key] & r
+                wide_m = m | classT.get(key, 0) | mask_over(node_lo(c_), c_.end_lineno)
                 if narrowed is not None:
                     m |= narrowed
+                    last_wide[0] = wide_m
                 else:
-                    m |= classT.get(key, 0) | mask_over(node_lo(c_), c_.end_lineno)
+                    m = wide_m
             else:
                 m |= tF | iT
                 if kind == "func":
@@ -438,10 +495,12 @@ def analyze_sqlglot(path):
                 lo, hi = node.lineno, node.end_lineno
                 m = mask_over(lo, hi)
                 imp = imp_over(lo, hi)
+                last_wide[0] = None
                 fm = finalize(m, imp, lo, hi, chain, node, "simple")
                 for l in range(lo, hi + 1):
                     unit_mask[l] = fm
                     unit_scope[l] = ("simple", chain, node)
+                    unit_wide[l] = last_wide[0]
 
     visit(tree.body, [])
     code = code_lines(text, N)
@@ -488,9 +547,11 @@ def analyze_sqlglot(path):
                 clsx[g] = sid(classT.get(key, 0) | mask_over(node_lo(c_), c_.end_lineno))
                 clsind[g] = c_.body[0].col_offset  # class body indent
         pq[g] = sid(m)
+    efw = [(-2 if unit_wide[l] is None else sid(unit_wide[l])) for l in range(1, N + 1)]
     return {
         "n": N,
         "ef": ef[1 : N + 1],
+        "efw": efw,
         "pq": pq[0 : N + 1],
         "cx": clsx[0 : N + 1],
         "ci": clsind[0 : N + 1],
